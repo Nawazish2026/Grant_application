@@ -2,13 +2,19 @@ from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker, declarative_base
 from pathlib import Path
 
-from backend.config import settings
+from backend.config import settings, BASE_DIR
 
-db_path = settings.database_url.replace("sqlite:///", "")
+db_url = settings.database_url
+if db_url.startswith("sqlite:///") and not db_url.startswith("sqlite:////"):
+    rel = db_url.replace("sqlite:///", "").lstrip("./")
+    abs_path = (BASE_DIR / rel).resolve()
+    db_url = f"sqlite:///{abs_path}"
+
+db_path = db_url.replace("sqlite:///", "")
 Path(db_path).parent.mkdir(parents=True, exist_ok=True)
 
 engine = create_engine(
-    settings.database_url,
+    db_url,
     connect_args={"check_same_thread": False},
     echo=False,
 )
@@ -26,4 +32,6 @@ def get_db():
 
 
 def init_db():
+    from backend import models  # Ensure all model tables are registered in Base.metadata
     Base.metadata.create_all(bind=engine)
+

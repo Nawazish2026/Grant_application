@@ -3,10 +3,16 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse
 from pathlib import Path
 
+from contextlib import asynccontextmanager
 from backend.database import init_db
 from backend.routers import assessments, analysis
 
 init_db()
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    init_db()
+    yield
 
 app = FastAPI(
     title="Grant Application Completeness Assistant",
@@ -15,6 +21,7 @@ app = FastAPI(
         "against supplied grant guidelines. Advisory use only."
     ),
     version="1.0.0",
+    lifespan=lifespan,
 )
 
 app.include_router(assessments.router)

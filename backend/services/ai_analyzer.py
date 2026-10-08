@@ -25,6 +25,63 @@ def _get_client():
     return genai.Client(api_key=settings.gemini_api_key)
 
 
+FALLBACK_MODELS = [
+    settings.gemini_model,
+    "gemini-3.5-flash",
+    "gemini-3.5-flash-lite",
+    "gemini-3.1-flash-lite",
+    "gemini-flash-latest",
+    "gemini-3.8-flash",
+]
+
+
+def _call_gemini(
+    prompt: str,
+    temperature: float = 0.1,
+    max_output_tokens: int = 8192,
+    is_json: bool = False,
+) -> str:
+    """Robust Gemini caller with exponential retry and model fallback pool for high resilience."""
+    client = _get_client()
+    models_to_try = []
+    for m in FALLBACK_MODELS:
+        if m and m not in models_to_try:
+            models_to_try.append(m)
+
+    last_error = None
+    for model_name in models_to_try:
+        for attempt in range(2):
+            try:
+                logger.info(f"Calling Gemini model: {model_name} (attempt {attempt + 1}, is_json={is_json})")
+                config_kwargs = {
+                    "temperature": temperature,
+                    "max_output_tokens": max_output_tokens,
+                }
+                if is_json:
+                    config_kwargs["response_mime_type"] = "application/json"
+
+                response = client.models.generate_content(
+                    model=model_name,
+                    contents=prompt,
+                    config=types.GenerateContentConfig(**config_kwargs),
+                )
+                if response and response.text:
+                    return response.text
+            except Exception as e:
+                last_error = e
+                err_str = str(e)
+                logger.warning(f"Model {model_name} attempt {attempt + 1} failed: {err_str[:120]}")
+                if "503" in err_str or "429" in err_str:
+                    time.sleep(1.0 * (attempt + 1))
+                    continue
+                else:
+                    break
+
+    raise RuntimeError(f"All Gemini models in fallback pool failed. Last error: {last_error}")
+
+
+
+
 EXTRACT_REQUIREMENTS_PROMPT = """You are an expert grant compliance analyst. Analyze the following grant/funding guideline document and extract ALL eligibility and submission requirements.
 
 For each requirement, provide:
@@ -77,33 +134,28 @@ APPLICATION DOCUMENT:
 ---
 
 For each requirement (identified by its index), provide:
-1. application_excerpt: The exact text from the application that addresses this requirement (quote directly)
-2. application_reference: Where in the application this excerpt appears (section/page)
-3. evidence_strength: One of "met" (fully addressed), "partial" (partially addressed), "missing" (not addressed at all), "ambiguous" (unclear if addressed)
-4. ai_reasoning: Brief explanation of why you assessed the evidence this way
-5. clarification_questions: Array of questions to ask the applicant about weak/missing/ambiguous evidence (empty array if evidence is strong)
-6. unsupported_claims: Array of claims the applicant makes that are NOT supported by evidence in the application (each with claim_text, application_reference, and explanation)
+1. application_excerpt: Direct quote from the application (keep under 25 words)
+2. application_reference: Section/heading where this excerpt appears
+3. evidence_strength: One of "met", "partial", "missing", "ambiguous"
+4. ai_reasoning: Concise explanation (1-2 sentences)
+5. clarification_questions: Array of {{"question_text": "...", "priority": "high|medium|low"}} for weak/missing evidence (or empty [])
+6. unsupported_claims: Array of {{"claim_text": "...", "application_reference": "...", "explanation": "..."}} (or empty [])
 
-Return valid JSON:
+Return valid JSON with key "mappings" containing an array of mapping objects:
 {{
   "mappings": [
     {{
       "requirement_index": 0,
       "application_excerpt": "...",
       "application_reference": "...",
-      "evidence_strength": "met|partial|missing|ambiguous",
+      "evidence_strength": "met",
       "ai_reasoning": "...",
-      "clarification_questions": [
-        {{"question_text": "...", "priority": "high|medium|low"}}
-      ],
-      "unsupported_claims": [
-        {{"claim_text": "...", "application_reference": "...", "explanation": "..."}}
-      ]
+      "clarification_questions": [],
+      "unsupported_claims": []
     }}
   ]
 }}
-
-Be precise with citations. Quote the application directly. Be strict but fair in assessments."""
+Keep responses concise to ensure full coverage without truncation."""
 
 
 GENERATE_SUMMARY_PROMPT = """You are an expert grant compliance analyst. Generate a comprehensive completeness summary report for this grant application assessment.
@@ -142,6 +194,26 @@ def _clean_json_response(text):
     return text.strip()
 
 
+def _parse_json_safe(raw_text: str) -> dict:
+    clean_text = _clean_json_response(raw_text)
+    try:
+        return json.loads(clean_text)
+    except json.JSONDecodeError:
+        start_obj = clean_text.find("{")
+        end_obj = clean_text.rfind("}")
+        if start_obj != -1 and end_obj != -1 and end_obj > start_obj:
+            try:
+                return json.loads(clean_text[start_obj:end_obj + 1])
+            except json.JSONDecodeError:
+                pass
+        for suffix in ["}]}", "]}", '"}]}', '"]}', "}", "]"]:
+            try:
+                return json.loads(clean_text.rstrip() + suffix)
+            except json.JSONDecodeError:
+                pass
+        raise
+
+
 async def extract_requirements(db: Session, assessment: Assessment) -> list[dict]:
     if not assessment.guideline_text:
         raise ValueError("No guideline document uploaded.")
@@ -152,26 +224,13 @@ async def extract_requirements(db: Session, assessment: Assessment) -> list[dict
         extra={"assessment_id": assessment.id, "workflow_step": "extract_requirements", "details": {"guideline_length": len(assessment.guideline_text)}},
     )
 
-    client = _get_client()
-
     prompt = EXTRACT_REQUIREMENTS_PROMPT.format(
         guideline_text=assessment.guideline_text[:50000]
     )
-
-    response = client.models.generate_content(
-        model=settings.gemini_model,
-        contents=prompt,
-        config=types.GenerateContentConfig(
-            temperature=0.1,
-            max_output_tokens=8192,
-        ),
-    )
-
-    raw_text = response.text
-    clean_text = _clean_json_response(raw_text)
+    raw_text = _call_gemini(prompt, temperature=0.1, max_output_tokens=8192, is_json=True)
 
     try:
-        data = json.loads(clean_text)
+        data = _parse_json_safe(raw_text)
     except json.JSONDecodeError as e:
         logger.error(
             f"Failed to parse requirements JSON: {e}",
@@ -239,44 +298,6 @@ async def map_application(db: Session, assessment: Assessment) -> list[dict]:
     if not requirements:
         raise ValueError("No requirements extracted. Run extraction first.")
 
-    req_json = [
-        {
-            "index": i,
-            "requirement_text": r.requirement_text,
-            "category": r.category,
-            "is_mandatory": r.is_mandatory,
-        }
-        for i, r in enumerate(requirements)
-    ]
-
-    client = _get_client()
-
-    prompt = MAP_APPLICATION_PROMPT.format(
-        requirements_json=json.dumps(req_json, indent=2),
-        application_text=assessment.application_text[:50000],
-    )
-
-    response = client.models.generate_content(
-        model=settings.gemini_model,
-        contents=prompt,
-        config=types.GenerateContentConfig(
-            temperature=0.1,
-            max_output_tokens=8192,
-        ),
-    )
-
-    raw_text = response.text
-    clean_text = _clean_json_response(raw_text)
-
-    try:
-        data = json.loads(clean_text)
-    except json.JSONDecodeError as e:
-        logger.error(
-            f"Failed to parse mapping JSON: {e}",
-            extra={"assessment_id": assessment.id, "workflow_step": "map_application", "details": {"raw_response_preview": raw_text[:300]}},
-        )
-        raise ValueError(f"AI returned invalid JSON: {e}")
-
     for req in requirements:
         for m in req.mappings:
             db.delete(m)
@@ -286,7 +307,37 @@ async def map_application(db: Session, assessment: Assessment) -> list[dict]:
             db.delete(c)
     db.flush()
 
-    mappings_data = data.get("mappings", [])
+    CHUNK_SIZE = 8
+    mappings_data = []
+
+    for chunk_start in range(0, len(requirements), CHUNK_SIZE):
+        chunk_reqs = requirements[chunk_start:chunk_start + CHUNK_SIZE]
+        req_json = [
+            {
+                "index": chunk_start + i,
+                "requirement_text": r.requirement_text,
+                "category": r.category,
+                "is_mandatory": r.is_mandatory,
+            }
+            for i, r in enumerate(chunk_reqs)
+        ]
+
+        prompt = MAP_APPLICATION_PROMPT.format(
+            requirements_json=json.dumps(req_json, indent=2),
+            application_text=assessment.application_text[:50000],
+        )
+        raw_text = _call_gemini(prompt, temperature=0.1, max_output_tokens=8192, is_json=True)
+
+        try:
+            data = _parse_json_safe(raw_text)
+            chunk_items = data if isinstance(data, list) else data.get("mappings", [])
+            mappings_data.extend(chunk_items)
+        except json.JSONDecodeError as e:
+            logger.warning(
+                f"Failed to parse mapping JSON chunk starting at {chunk_start}: {e}",
+                extra={"assessment_id": assessment.id, "workflow_step": "map_application", "details": {"raw_response_preview": raw_text[:300]}},
+            )
+
     strength_counts = {"met": 0, "partial": 0, "missing": 0, "ambiguous": 0}
     questions_count = 0
     claims_count = 0
@@ -396,22 +447,10 @@ async def generate_summary(db: Session, assessment: Assessment) -> str:
             "description": doc.description,
         })
 
-    client = _get_client()
-
     prompt = GENERATE_SUMMARY_PROMPT.format(
         assessment_json=json.dumps(assessment_data, indent=2)[:30000]
     )
-
-    response = client.models.generate_content(
-        model=settings.gemini_model,
-        contents=prompt,
-        config=types.GenerateContentConfig(
-            temperature=0.2,
-            max_output_tokens=4096,
-        ),
-    )
-
-    summary = response.text
+    summary = _call_gemini(prompt, temperature=0.2, max_output_tokens=4096)
     assessment.summary_report = summary
     db.commit()
 
