@@ -27,7 +27,7 @@ An AI-powered tool that reviews draft funding applications against supplied gran
 | Layer | Technology |
 |-------|-----------|
 | Backend | Python 3.11+ / FastAPI |
-| AI | Google Gemini API (gemini-2.5-flash) |
+| AI | Google Gemini API (gemini-3.8-flash) |
 | Database | SQLite (via SQLAlchemy) |
 | Frontend | Vanilla HTML/CSS/JS |
 | Document Parsing | PyPDF2, python-docx |

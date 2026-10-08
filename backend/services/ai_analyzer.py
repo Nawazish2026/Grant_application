@@ -159,7 +159,7 @@ async def extract_requirements(db: Session, assessment: Assessment) -> list[dict
     )
 
     response = client.models.generate_content(
-        model="gemini-2.5-flash",
+        model=settings.gemini_model,
         contents=prompt,
         config=types.GenerateContentConfig(
             temperature=0.1,
@@ -257,7 +257,7 @@ async def map_application(db: Session, assessment: Assessment) -> list[dict]:
     )
 
     response = client.models.generate_content(
-        model="gemini-2.5-flash",
+        model=settings.gemini_model,
         contents=prompt,
         config=types.GenerateContentConfig(
             temperature=0.1,
@@ -403,7 +403,7 @@ async def generate_summary(db: Session, assessment: Assessment) -> str:
     )
 
     response = client.models.generate_content(
-        model="gemini-2.5-flash",
+        model=settings.gemini_model,
         contents=prompt,
         config=types.GenerateContentConfig(
             temperature=0.2,
