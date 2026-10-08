@@ -26,12 +26,15 @@ def _get_client():
 
 
 FALLBACK_MODELS = [
-    settings.gemini_model,
-    "gemini-3.5-flash",
-    "gemini-3.5-flash-lite",
-    "gemini-3.1-flash-lite",
-    "gemini-flash-latest",
-    "gemini-3.8-flash",
+    m for m in [
+        settings.gemini_model,
+        "gemini-3.5-flash",
+        "gemini-3.5-flash-lite",
+        "gemini-3.1-flash-lite",
+        "gemini-flash-latest",
+        "gemini-3.8-flash",
+    ]
+    if m and "2.5-flash" not in m
 ]
 
 
